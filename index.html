@@ -1,0 +1,734 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Букет для Лисёна</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Marck+Script&display=swap" rel="stylesheet">
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+  canvas {
+    position: fixed; inset: 0;
+    display: block; width: 100%; height: 100%; cursor: pointer;
+    filter: saturate(1.12) contrast(1.06);   /* final colour correction */
+  }
+  .caption {
+    position: fixed; left: 0; right: 0; top: 3.5vh;
+    padding: 0 4vw;
+    text-align: center;
+    font-family: "Marck Script", "Segoe Script", cursive;
+    font-size: min(5.6vh, 7vw);
+    line-height: 1.2;
+    color: #f4ecff;
+    text-shadow:
+      0 0 6px rgba(150, 180, 255, 0.55),
+      0 0 22px rgba(90, 130, 255, 0.45),
+      0 0 46px rgba(255, 110, 160, 0.25);
+    opacity: 0;
+    transform: translateY(-10px);
+    animation: appear 2.2s ease-out 2.4s forwards;
+    pointer-events: none; user-select: none;
+  }
+  .heart {
+    display: inline-block;
+    margin-left: 0.15em;
+    text-shadow: 0 0 18px rgba(255, 60, 100, 0.7);
+    animation: beat 1.3s ease-in-out 4.6s infinite;
+  }
+  @keyframes appear { to { opacity: 1; transform: none; } }
+  @keyframes beat {
+    0%, 100% { transform: scale(1); }
+    15% { transform: scale(1.22); }
+    30% { transform: scale(1); }
+    45% { transform: scale(1.14); }
+  }
+  .phrase {
+    position: fixed;
+    font-family: "Marck Script", "Segoe Script", cursive;
+    font-size: min(4.2vh, 5.4vw);
+    white-space: nowrap;
+    color: #ffdbe8;
+    text-shadow:
+      0 0 6px rgba(255, 140, 180, 0.6),
+      0 0 22px rgba(255, 90, 150, 0.35);
+    rotate: var(--rot, 0deg);
+    opacity: 0;
+    animation: phraseIn 1.6s ease-out forwards, floaty 5s ease-in-out infinite;
+    pointer-events: none; user-select: none;
+  }
+  @keyframes phraseIn { from { opacity: 0; scale: 0.85; } to { opacity: 1; scale: 1; } }
+  @keyframes floaty { 0%, 100% { translate: 0 0; } 50% { translate: 0 -6px; } }
+  .hint {
+    position: fixed; right: 16px; bottom: 12px;
+    font: 13px/1.4 "Segoe UI", system-ui, sans-serif; color: rgba(190, 200, 235, 0.45);
+    user-select: none; pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="caption">Лисён, я тебя очень сильно люблю<span class="heart">❤️</span></div>
+<div id="phrases"></div>
+<div class="hint">клик — собрать новый букет</div>
+<script>
+"use strict";
+
+const cvs = document.getElementById("c");
+const ctx = cvs.getContext("2d");
+
+let W, H, S, cx, cy, dpr;
+let seed = 7;
+let flowers = [], leaves = [], fillers = [], falling = [];
+let t0 = performance.now();
+let lastSpawn = 0;
+
+// ---------- helpers ----------
+function rngFrom(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const easeOutBack = p => { const c = 1.6; p -= 1; return 1 + (c + 1) * p * p * p + c * p * p; };
+const easeOut = p => 1 - Math.pow(1 - p, 3);
+
+function petalPath(g, len, w) {
+  g.beginPath();
+  g.moveTo(0, 0);
+  g.bezierCurveTo(len * 0.3, -w, len * 0.75, -w, len, -w * 0.15);
+  g.quadraticCurveTo(len * 1.03, 0, len, w * 0.15);
+  g.bezierCurveTo(len * 0.75, w, len * 0.3, w, 0, 0);
+  g.closePath();
+}
+
+const LIGHT = -Math.PI * 0.75;   // light comes from the upper left
+
+// shade a petal (current path) by how much it faces the light
+function petalLight(g, a, dark, bright) {
+  const away = (1 - Math.cos(a - LIGHT)) / 2;   // 0 = facing light, 1 = facing away
+  g.fillStyle = `rgba(0, 4, 25, ${dark * away})`;
+  g.fill();
+  g.fillStyle = `rgba(215, 230, 255, ${bright * (1 - away)})`;
+  g.fill();
+}
+
+// spherical lighting over the whole flower: highlight top-left, shadow bottom-right
+function sphereLight(g, r) {
+  g.save();
+  g.globalCompositeOperation = "source-atop";
+  const lg = g.createRadialGradient(-r * 0.38, -r * 0.42, r * 0.04, 0, 0, r * 1.15);
+  lg.addColorStop(0, "rgba(255,255,255,0.30)");
+  lg.addColorStop(0.35, "rgba(255,255,255,0.06)");
+  lg.addColorStop(0.62, "rgba(0,0,20,0.10)");
+  lg.addColorStop(1, "rgba(0,0,15,0.62)");
+  g.fillStyle = lg;
+  g.fillRect(-r * 1.3, -r * 1.3, r * 2.6, r * 2.6);
+  g.restore();
+}
+
+function offscreen(r, k) {
+  const sizeCss = r * k;
+  const c = document.createElement("canvas");
+  c.width = c.height = Math.max(1, Math.ceil(sizeCss * dpr));
+  const g = c.getContext("2d");
+  g.scale(dpr, dpr);
+  g.translate(sizeCss / 2, sizeCss / 2);
+  return { c, g, sizeCss };
+}
+
+// ---------- blue chrysanthemum ----------
+function makeChrysanthemum(r, rnd) {
+  const { c, g, sizeCss } = offscreen(r, 2.4);
+  const LAYERS = 9;
+  for (let l = 0; l < LAYERS; l++) {
+    const f = 1 - l / LAYERS;              // 1 = outer layer, -> 0 = centre
+    const n = Math.round(14 + 22 * f);
+    const len = r * (0.16 + 0.84 * f);
+    const w = len * (0.15 + 0.08 * (1 - f));
+    const off = rnd() * Math.PI * 2;
+    // outer petals: bright with pale tips; inner: deeper, slightly violet
+    const base = `hsl(${226 - 6 * (1 - f)}, 80%, ${12 + 6 * f}%)`;
+    const mid  = `hsl(${224 - 4 * (1 - f)}, 78%, ${28 + 8 * f}%)`;
+    const tip  = `hsl(${216 + 8 * (1 - f)}, 92%, ${50 + 16 * f}%)`;
+    for (let i = 0; i < n; i++) {
+      const a = off + (i / n) * Math.PI * 2 + (rnd() - 0.5) * 0.18;
+      const ll = len * (0.86 + rnd() * 0.22);
+      const ww = w * (0.85 + rnd() * 0.3);
+      g.save();
+      g.rotate(a);
+      const gr = g.createLinearGradient(0, 0, ll, 0);
+      gr.addColorStop(0, base);
+      gr.addColorStop(0.5, mid);
+      gr.addColorStop(1, tip);
+      g.fillStyle = gr;
+      g.shadowColor = "rgba(4, 12, 45, 0.45)";
+      g.shadowBlur = r * 0.05;
+      petalPath(g, ll, ww);
+      g.fill();
+      g.shadowBlur = 0;
+      petalLight(g, a, 0.45, 0.16);
+      g.strokeStyle = "rgba(255,255,255,0.13)";
+      g.lineWidth = ww * 0.14;
+      g.beginPath();
+      g.moveTo(ll * 0.2, 0);
+      g.lineTo(ll * 0.85, 0);
+      g.stroke();
+      g.restore();
+    }
+  }
+  sphereLight(g, r);
+  // tight centre
+  const cr = r * 0.13;
+  const rg = g.createRadialGradient(-cr * 0.2, -cr * 0.2, 0, 0, 0, cr);
+  rg.addColorStop(0, "#d6e5ff");
+  rg.addColorStop(0.45, "#4673e0");
+  rg.addColorStop(1, "#0d2668");
+  g.fillStyle = rg;
+  g.beginPath(); g.arc(0, 0, cr, 0, Math.PI * 2); g.fill();
+  for (let i = 0; i < 26; i++) {
+    const a = i * 2.39996, d = cr * 0.85 * Math.sqrt(i / 26);
+    g.fillStyle = "rgba(220,235,255,0.55)";
+    g.beginPath(); g.arc(Math.cos(a) * d, Math.sin(a) * d, cr * 0.07, 0, Math.PI * 2); g.fill();
+  }
+  return { c, sizeCss };
+}
+
+// ---------- rose ----------
+const ROSE_PALETTES = [
+  { dark: "#9b2449", mid: "#dc6b8a", light: "#fbd5de", edge: "rgba(110,15,45,0.35)" },  // pink
+  { dark: "#b8495f", mid: "#f09ba5", light: "#fff0ee", edge: "rgba(130,35,55,0.3)" },   // blush
+  { dark: "#c98f8f", mid: "#f4dcd5", light: "#fffaf5", edge: "rgba(140,80,80,0.3)" },   // cream
+];
+
+function makeRose(r, pal, rnd) {
+  const { c, g, sizeCss } = offscreen(r, 2.4);
+  const N = 26;
+  const rot0 = rnd() * Math.PI * 2;
+  for (let k = N - 1; k >= 0; k--) {
+    const t = k / (N - 1);                  // 1 = outer petal, 0 = innermost
+    const ang = rot0 + k * 2.39996;
+    const d = r * 0.42 * Math.pow(t, 0.85);
+    const rx = r * (0.18 + 0.44 * t);
+    const ry = r * (0.12 + 0.30 * t);
+    const x = Math.cos(ang) * d, y = Math.sin(ang) * d;
+    const gr = g.createRadialGradient(0, 0, r * 0.02, 0, 0, d + ry * 1.2 + 0.01);
+    gr.addColorStop(0, pal.dark);
+    gr.addColorStop(0.4, pal.mid);
+    gr.addColorStop(0.82, pal.mid);
+    gr.addColorStop(1, pal.light);
+    g.beginPath();
+    g.ellipse(x, y, rx, ry, ang + Math.PI / 2, 0, Math.PI * 2);
+    g.fillStyle = gr;
+    g.shadowColor = "rgba(70,10,30,0.5)";
+    g.shadowBlur = r * 0.09;
+    g.fill();
+    g.shadowBlur = 0;
+    petalLight(g, ang, 0.32, 0.12);
+    g.strokeStyle = pal.edge;
+    g.lineWidth = r * 0.014;
+    g.stroke();
+    // light curled rim on the outer side of the petal
+    g.beginPath();
+    g.ellipse(x, y, rx * 0.97, ry * 0.94, ang + Math.PI / 2, -0.35 * Math.PI, 0.35 * Math.PI);
+    g.strokeStyle = "rgba(255,255,255,0.55)";
+    g.lineWidth = r * 0.02;
+    g.stroke();
+  }
+  sphereLight(g, r);
+  // spiral heart
+  g.beginPath();
+  for (let a = 0; a < Math.PI * 4.5; a += 0.08) {
+    const rr = r * 0.016 * a;
+    const px = Math.cos(a + rot0) * rr, py = Math.sin(a + rot0) * rr;
+    a === 0 ? g.moveTo(px, py) : g.lineTo(px, py);
+  }
+  g.strokeStyle = pal.dark;
+  g.lineWidth = r * 0.03;
+  g.lineCap = "round";
+  g.stroke();
+  return { c, sizeCss };
+}
+
+// ---------- composition ----------
+// [x, y, radius] in units of S, relative to (cx, cy)
+const CHRYS = [
+  [0.00, -0.31, 0.125], [-0.17, -0.20, 0.12], [0.17, -0.21, 0.12], [0.00, -0.15, 0.11],
+  [-0.08, -0.04, 0.12], [0.11, -0.03, 0.12], [-0.29, -0.04, 0.10], [0.30, -0.05, 0.10],
+];
+const ROSES = [
+  [-0.13, -0.37, 0.075], [0.14, -0.36, 0.075], [-0.27, -0.17, 0.07], [0.28, -0.17, 0.07],
+  [0.02, 0.05, 0.075], [-0.19, 0.06, 0.065], [0.21, 0.05, 0.065],
+];
+
+function build() {
+  const rnd = rngFrom(seed);
+  flowers = [];
+  const add = (list, kind) => list.forEach(([x, y, r]) => {
+    const jr = r * (0.94 + rnd() * 0.12);
+    const f = {
+      kind,
+      x: x + (rnd() - 0.5) * 0.025,
+      y: y + (rnd() - 0.5) * 0.025,
+      r: jr,
+      rot: rnd() * Math.PI * 2,
+      phase: rnd() * Math.PI * 2,
+    };
+    f.img = kind === "chrys"
+      ? makeChrysanthemum(jr * S, rnd)
+      : makeRose(jr * S, ROSE_PALETTES[Math.floor(rnd() * ROSE_PALETTES.length)], rnd);
+    flowers.push(f);
+  });
+  add(CHRYS, "chrys");
+  add(ROSES, "rose");
+  flowers.sort((a, b) => a.y - b.y);
+  // bloom order: from the centre outwards
+  const order = flowers.map((f, i) => [Math.hypot(f.x, f.y + 0.15), i]).sort((a, b) => a[0] - b[0]);
+  order.forEach(([, i], n) => { flowers[i].delay = 0.5 + n * 0.11; });
+
+  leaves = [];
+  const LN = 14;
+  for (let i = 0; i < LN; i++) {
+    const a = -Math.PI + 0.12 + (i / (LN - 1)) * (Math.PI - 0.24) + (rnd() - 0.5) * 0.12;
+    leaves.push({
+      x: Math.cos(a) * 0.24, y: -0.14 + Math.sin(a) * 0.2,
+      ang: a + (rnd() - 0.5) * 0.3,
+      len: 0.17 * (0.8 + rnd() * 0.4), w: 0.045 * (0.85 + rnd() * 0.3),
+      dark: rnd() < 0.5, phase: rnd() * 6,
+    });
+  }
+  leaves.push({ x: -0.22, y: 0.04, ang: Math.PI * 0.88, len: 0.2, w: 0.05, dark: true, phase: 1 });
+  leaves.push({ x: 0.22, y: 0.04, ang: Math.PI * 0.12, len: 0.2, w: 0.05, dark: false, phase: 2 });
+
+  fillers = [];
+  for (let i = 0; i < 20; i++) {
+    const a = -Math.PI + 0.05 + rnd() * (Math.PI - 0.1);
+    const rr = 0.38 + rnd() * 0.07;
+    const dots = [];
+    const n = 6 + Math.floor(rnd() * 6);
+    for (let k = 0; k < n; k++) dots.push([(rnd() - 0.5) * 0.05, (rnd() - 0.5) * 0.05, 0.004 + rnd() * 0.004]);
+    fillers.push({ x: Math.cos(a) * rr, y: -0.12 + Math.sin(a) * rr * 0.85, dots, phase: rnd() * 6 });
+  }
+  falling = [];
+  t0 = performance.now();
+}
+
+function layout() {
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  cvs.width = Math.round(W * dpr); cvs.height = Math.round(H * dpr);
+  S = Math.min(W * 0.95, H * 0.74);
+  cx = W / 2; cy = H * 0.535;
+  build();
+  placePhrases();
+}
+
+// ---------- drawing pieces ----------
+const P = (x, y) => [cx + x * S, cy + y * S];
+
+function drawBackground() {
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, W, H);
+  // faint blue glow behind the bouquet
+  const g = ctx.createRadialGradient(cx, cy - S * 0.15, S * 0.02, cx, cy - S * 0.1, S * 0.75);
+  g.addColorStop(0, "rgba(40, 70, 170, 0.32)");
+  g.addColorStop(0.5, "rgba(25, 30, 90, 0.14)");
+  g.addColorStop(1, "rgba(0, 0, 0, 0)");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+}
+
+function colorGrade() {
+  // cool highlights on top, warm tint low down, then a vignette
+  ctx.save();
+  ctx.globalCompositeOperation = "soft-light";
+  const cg = ctx.createLinearGradient(0, 0, 0, H);
+  cg.addColorStop(0, "rgba(70, 120, 255, 0.35)");
+  cg.addColorStop(0.6, "rgba(150, 110, 220, 0.15)");
+  cg.addColorStop(1, "rgba(255, 160, 120, 0.25)");
+  ctx.fillStyle = cg;
+  ctx.fillRect(0, 0, W, H);
+  ctx.globalCompositeOperation = "source-over";
+  const v = ctx.createRadialGradient(cx, cy, S * 0.35, cx, cy, Math.max(W, H) * 0.75);
+  v.addColorStop(0, "rgba(0,0,0,0)");
+  v.addColorStop(1, "rgba(0,0,0,0.65)");
+  ctx.fillStyle = v;
+  ctx.fillRect(0, 0, W, H);
+  ctx.restore();
+}
+
+function drawBackWrap(alpha) {
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  const [lx, ly] = P(-0.46, -0.30), [rx, ry] = P(0.46, -0.30);
+  const [bl, by] = P(-0.05, 0.40), [br] = P(0.05, 0.40);
+  const g = ctx.createLinearGradient(0, ly, 0, by);
+  g.addColorStop(0, "#d9cdee");
+  g.addColorStop(1, "#7f6aa9");
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.moveTo(bl, by);
+  ctx.lineTo(lx, ly);
+  ctx.quadraticCurveTo(...P(-0.30, -0.52), ...P(-0.12, -0.44));
+  ctx.quadraticCurveTo(...P(0.0, -0.58), ...P(0.12, -0.44));
+  ctx.quadraticCurveTo(...P(0.30, -0.52), rx, ry);
+  ctx.lineTo(br, by);
+  ctx.closePath();
+  ctx.shadowColor = "rgba(60,50,100,0.18)";
+  ctx.shadowBlur = S * 0.03;
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawStems(alpha) {
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.lineCap = "round";
+  const [tx, ty] = P(0, 0.40);
+  for (const f of flowers) {
+    const [fx, fy] = P(f.x, f.y);
+    const tieX = tx + (fx - cx) * 0.08;
+    ctx.strokeStyle = "#3d7b42";
+    ctx.lineWidth = S * 0.0075;
+    ctx.beginPath();
+    ctx.moveTo(fx, fy);
+    ctx.quadraticCurveTo(cx + (fx - cx) * 0.55, (fy + ty) / 2, tieX, ty);
+    ctx.quadraticCurveTo(tieX + (fx - cx) * 0.1, ty + S * 0.12, cx + (fx - cx) * 0.3, cy + S * 0.62);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function drawLeaf(l, grow, time) {
+  const [x, y] = P(l.x, l.y);
+  const len = l.len * S * grow, w = l.w * S * grow;
+  if (len < 1) return;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(l.ang + Math.sin(time * 0.9 + l.phase) * 0.025);
+  const g = ctx.createLinearGradient(0, -w, 0, w);
+  g.addColorStop(0, l.dark ? "#3a7d47" : "#5aa060");
+  g.addColorStop(1, l.dark ? "#173f27" : "#2a6236");
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.bezierCurveTo(len * 0.3, -w, len * 0.7, -w * 0.8, len, 0);
+  ctx.bezierCurveTo(len * 0.7, w * 0.8, len * 0.3, w, 0, 0);
+  ctx.shadowColor = "rgba(10,40,20,0.3)";
+  ctx.shadowBlur = S * 0.01;
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = "rgba(210,245,210,0.35)";
+  ctx.lineWidth = Math.max(1, S * 0.0025);
+  ctx.beginPath();
+  ctx.moveTo(len * 0.05, 0);
+  ctx.quadraticCurveTo(len * 0.5, -w * 0.12, len * 0.95, 0);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawFiller(f, alpha, time) {
+  const sway = Math.sin(time * 0.8 + f.phase) * S * 0.003;
+  const [x, y] = P(f.x, f.y);
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.strokeStyle = "rgba(90,130,90,0.7)";
+  ctx.lineWidth = Math.max(1, S * 0.0018);
+  for (const [dx, dy, r] of f.dots) {
+    ctx.beginPath();
+    ctx.moveTo(x + sway, y);
+    ctx.lineTo(x + dx * S + sway, y + dy * S);
+    ctx.stroke();
+  }
+  for (const [dx, dy, r] of f.dots) {
+    ctx.fillStyle = "#ffffff";
+    ctx.beginPath();
+    ctx.arc(x + dx * S + sway, y + dy * S, r * S, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = "rgba(170,185,230,0.8)";
+    ctx.beginPath();
+    ctx.arc(x + dx * S + sway, y + dy * S, r * S * 0.35, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawFlower(f, time) {
+  const p = clamp((time - f.delay) / 1.3, 0, 1);
+  if (p <= 0) return;
+  const sc = easeOutBack(p);
+  const [x, y] = P(f.x, f.y);
+  const sway = Math.sin(time * 0.7 + f.phase);
+  ctx.save();
+  ctx.globalAlpha = clamp(p * 2, 0, 1);
+  ctx.translate(x + sway * S * 0.004, y);
+  ctx.rotate(f.rot + sway * 0.03 + (1 - p) * -0.8);
+  ctx.scale(sc, sc);
+  // cast shadow onto the flowers behind (shadow units are device pixels)
+  ctx.shadowColor = "rgba(0, 0, 0, 0.7)";
+  ctx.shadowBlur = S * 0.025 * dpr;
+  ctx.shadowOffsetX = S * 0.006 * dpr;
+  ctx.shadowOffsetY = S * 0.012 * dpr;
+  const s = f.img.sizeCss;
+  ctx.drawImage(f.img.c, -s / 2, -s / 2, s, s);
+  ctx.restore();
+}
+
+function drawFrontWrap(alpha) {
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  const top = 0.12;
+  const pts = [P(-0.33, top), P(-0.16, top + 0.035), P(0, top - 0.01), P(0.17, top + 0.03), P(0.33, top)];
+  const [bl, by] = P(-0.055, 0.44), [br] = P(0.055, 0.44);
+  const g = ctx.createLinearGradient(pts[0][0], 0, pts[4][0], 0);
+  g.addColorStop(0, "#8a72bb");
+  g.addColorStop(0.45, "#dcd0f1");
+  g.addColorStop(1, "#7a63ab");
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.moveTo(bl, by);
+  ctx.lineTo(...pts[0]);
+  for (let i = 1; i < pts.length; i++) {
+    const [px, py] = pts[i - 1], [qx, qy] = pts[i];
+    ctx.quadraticCurveTo((px + qx) / 2, Math.min(py, qy) - S * 0.03, qx, qy);
+  }
+  ctx.lineTo(br, by);
+  ctx.closePath();
+  ctx.shadowColor = "rgba(50,30,90,0.25)";
+  ctx.shadowBlur = S * 0.025;
+  ctx.shadowOffsetY = -S * 0.005;
+  ctx.fill();
+  ctx.shadowColor = "transparent";
+  // folds
+  ctx.lineWidth = Math.max(1, S * 0.002);
+  [[1, "rgba(255,255,255,0.55)"], [3, "rgba(255,255,255,0.45)"], [2, "rgba(90,60,140,0.18)"]].forEach(([i, col]) => {
+    ctx.strokeStyle = col;
+    ctx.beginPath();
+    ctx.moveTo(...pts[i]);
+    ctx.lineTo(cx + (pts[i][0] - cx) * 0.15, by);
+    ctx.stroke();
+  });
+  ctx.restore();
+}
+
+function drawBow(alpha, time) {
+  const [bx, by] = P(0, 0.41);
+  const s = S;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.translate(bx, by);
+  ctx.rotate(Math.sin(time * 0.6) * 0.02);
+  const satin = (x0, x1) => {
+    const g = ctx.createLinearGradient(x0, -s * 0.05, x1, s * 0.05);
+    g.addColorStop(0, "#14246b");
+    g.addColorStop(0.5, "#3f63d6");
+    g.addColorStop(1, "#14246b");
+    return g;
+  };
+  ctx.shadowColor = "rgba(10,20,60,0.35)";
+  ctx.shadowBlur = s * 0.012;
+  // tails
+  ctx.fillStyle = satin(-s * 0.05, s * 0.05);
+  [[-1], [1]].forEach(([d]) => {
+    ctx.beginPath();
+    ctx.moveTo(d * s * 0.008, 0);
+    ctx.quadraticCurveTo(d * s * 0.04, s * 0.08, d * s * 0.03, s * 0.16);
+    ctx.lineTo(d * s * 0.055, s * 0.145);
+    ctx.lineTo(d * s * 0.07, s * 0.17);
+    ctx.quadraticCurveTo(d * s * 0.075, s * 0.07, d * s * 0.02, 0);
+    ctx.closePath();
+    ctx.fill();
+  });
+  // loops
+  [[-1], [1]].forEach(([d]) => {
+    ctx.fillStyle = satin(0, d * s * 0.1);
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.bezierCurveTo(d * s * 0.05, -s * 0.07, d * s * 0.12, -s * 0.05, d * s * 0.1, 0);
+    ctx.bezierCurveTo(d * s * 0.12, s * 0.045, d * s * 0.05, s * 0.04, 0, 0);
+    ctx.fill();
+  });
+  // knot
+  const kg = ctx.createRadialGradient(-s * 0.006, -s * 0.006, 0, 0, 0, s * 0.02);
+  kg.addColorStop(0, "#6f8ff0");
+  kg.addColorStop(1, "#1a2c78");
+  ctx.fillStyle = kg;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, s * 0.02, s * 0.017, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function updateFalling(time, dt) {
+  if (time > 2.5 && time - lastSpawn > 0.7 && falling.length < 18) {
+    lastSpawn = time;
+    const blue = Math.random() < 0.7;
+    falling.push({
+      x: cx + (Math.random() - 0.5) * S * 0.7,
+      y: cy - S * 0.2 + (Math.random() - 0.5) * S * 0.2,
+      vx: (Math.random() - 0.5) * S * 0.02,
+      vy: S * (0.03 + Math.random() * 0.03),
+      rot: Math.random() * 6, vr: (Math.random() - 0.5) * 2,
+      len: S * (0.018 + Math.random() * 0.012),
+      color: blue ? `hsla(${215 + Math.random() * 10}, 85%, ${55 + Math.random() * 15}%, 0.85)`
+                  : "rgba(240,150,170,0.85)",
+      phase: Math.random() * 6,
+    });
+  }
+  for (const p of falling) {
+    p.x += (p.vx + Math.sin(time * 1.5 + p.phase) * S * 0.02) * dt;
+    p.y += p.vy * dt;
+    p.rot += p.vr * dt;
+  }
+  falling = falling.filter(p => p.y < H + 20);
+}
+
+function drawFalling() {
+  for (const p of falling) {
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.rot);
+    ctx.fillStyle = p.color;
+    petalPath(ctx, p.len, p.len * 0.25);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+// ---------- side phrases ----------
+const PHRASES = ["Любовь моя", "Моё солнышко"];   // a ❤️ is added to each
+const phraseLayer = document.getElementById("phrases");
+const overlaps = (a, b) => a[0] < b[2] && a[2] > b[0] && a[1] < b[3] && a[3] > b[1];
+
+function placePhrases() {
+  phraseLayer.textContent = "";
+  if (S < 10) return;
+  const cap = document.querySelector(".caption").getBoundingClientRect();
+  // areas the phrases must not cover: the bouquet, the caption, the hint
+  const blocked = [
+    [cx - 0.48 * S, cy - 0.62 * S, cx + 0.48 * S, cy + 0.17 * S],
+    [cx - 0.37 * S, cy + 0.08 * S, cx + 0.37 * S, cy + 0.47 * S],
+    [cx - 0.14 * S, cy + 0.35 * S, cx + 0.14 * S, cy + 0.67 * S],
+    [0, cap.top - 6, W, cap.bottom + 10],
+    [W - 230, H - 40, W, H],
+  ];
+  const list = [...PHRASES, ...PHRASES].sort(() => Math.random() - 0.5);
+  let shown = 0;
+  list.forEach((text, i) => {
+    const el = document.createElement("div");
+    el.className = "phrase";
+    el.append(text + " ");
+    const heart = document.createElement("span");
+    heart.textContent = "❤️";
+    el.append(heart);
+    el.style.setProperty("--rot", ((Math.random() - 0.5) * 16).toFixed(1) + "deg");
+    phraseLayer.append(el);
+    const w = el.offsetWidth, h = el.offsetHeight, pad = 12;
+    const leftSide = i % 2 === 0;
+    for (let k = 0; k < 300; k++) {
+      const x = leftSide
+        ? pad + Math.random() * (cx - w - 2 * pad)
+        : cx + pad + Math.random() * (W - cx - w - 2 * pad);
+      const y = pad + Math.random() * (H - h - 2 * pad);
+      const r = [x - pad, y - pad, x + w + pad, y + h + pad];
+      if (x < 0 || blocked.some(b => overlaps(r, b))) continue;
+      el.style.left = x + "px";
+      el.style.top = y + "px";
+      const d = (3.4 + shown * 0.7).toFixed(1) + "s";
+      el.style.animationDelay = `${d}, ${d}`;
+      blocked.push(r);
+      shown++;
+      return;
+    }
+    el.remove();   // no free spot on this screen size
+  });
+}
+
+// ---------- floating hearts (behind the bouquet) ----------
+let hearts = [], lastHeart = 0;
+
+function heartPath(g, s) {
+  g.beginPath();
+  g.moveTo(0, s * 0.35);
+  g.bezierCurveTo(-s * 1.1, -s * 0.35, -s * 0.45, -s * 1.05, 0, -s * 0.45);
+  g.bezierCurveTo(s * 0.45, -s * 1.05, s * 1.1, -s * 0.35, 0, s * 0.35);
+  g.closePath();
+}
+
+function updateHearts(time, dt) {
+  if (time - lastHeart > 0.35 && hearts.length < 40) {
+    lastHeart = time;
+    hearts.push({
+      x: Math.random() * W,
+      y: H + 30,
+      vy: S * (0.04 + Math.random() * 0.05),
+      size: S * (0.012 + Math.random() * 0.018),
+      alpha: 0.2 + Math.random() * 0.35,
+      hue: 335 + Math.random() * 25,
+      phase: Math.random() * 6,
+    });
+  }
+  for (const h of hearts) h.y -= h.vy * dt;
+  hearts = hearts.filter(h => h.y > -40);
+}
+
+function drawHearts(time) {
+  for (const h of hearts) {
+    const fade = clamp(h.y / (H * 0.35), 0, 1);   // fade out towards the top
+    ctx.save();
+    ctx.translate(h.x + Math.sin(time * 1.2 + h.phase) * S * 0.015, h.y);
+    ctx.rotate(Math.sin(time * 0.9 + h.phase) * 0.25);
+    ctx.globalAlpha = h.alpha * fade;
+    ctx.fillStyle = `hsl(${h.hue}, 85%, 62%)`;
+    ctx.shadowColor = `hsl(${h.hue}, 90%, 60%)`;
+    ctx.shadowBlur = h.size * 1.5 * dpr;
+    heartPath(ctx, h.size);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+// ---------- main loop ----------
+let prev = performance.now();
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (window.innerWidth !== W || window.innerHeight !== H) layout();
+  if (S < 10) return;
+  const time = (now - t0) / 1000;
+  const dt = Math.min(0.05, (now - prev) / 1000);
+  prev = now;
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  drawBackground();
+
+  updateHearts(time, dt);
+  drawHearts(time);
+
+  const base = easeOut(clamp(time / 0.9, 0, 1));
+  drawBackWrap(base);
+  drawStems(base);
+  for (const l of leaves) drawLeaf(l, easeOut(clamp((time - 0.2) / 1.0, 0, 1)), time);
+  const fa = clamp((time - 1.2) / 1.0, 0, 1);
+  for (const f of fillers) drawFiller(f, fa, time);
+  for (const f of flowers) drawFlower(f, time);
+  drawFrontWrap(base);
+  drawBow(clamp((time - 0.4) / 0.8, 0, 1), time);
+
+  updateFalling(time, dt);
+  drawFalling();
+  colorGrade();
+}
+
+cvs.addEventListener("click", () => { seed = (seed * 9301 + 49297) % 233280 + 1; build(); placePhrases(); lastSpawn = 0; lastHeart = 0; hearts = []; });
+
+layout();
+document.fonts.ready.then(placePhrases);   // re-measure once the script font has loaded
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
